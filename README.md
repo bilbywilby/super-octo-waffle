@@ -1,3 +1,196 @@
+#!/usr/bin/env sh
+set -euo pipefail
+umask 077
+
+echo "==> [1/5] Creating directories..."
+mkdir -p core/lib/ultra/wildcards tests docs/diagrams
+
+echo "==> [2/5] Writing core/lib/ultra/wildcards/filelock.py..."
+cat << 'EOF' > core/lib/ultra/wildcards/filelock.py
+"""Machine-local file locking utility using fcntl.flock."""
+import fcntl
+import os
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Union
+
+
+class FileLockError(Exception):
+    """Raised when file locking fails."""
+    pass
+
+
+@contextmanager
+def file_lock(lock_path: Union[str, Path], exclusive: bool = True, timeout: float = 5.0):
+    """Context manager for machine-local file locking with fcntl."""
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = os.O_RDWR | os.O_CREAT
+    flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    
+    fd = os.open(str(path), mode, 0o600)
+    try:
+        fcntl.flock(fd, flags)
+        yield path
+    except OSError as e:
+        raise FileLockError(f"Failed to acquire lock on {path}: {e}") from e
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+EOF
+
+echo "==> [3/5] Writing core/lib/ultra/wildcards/checkpoint.py..."
+cat << 'EOF' > core/lib/ultra/wildcards/checkpoint.py
+"""Checkpoint manager with atomic writes, checksum verification, and corruption detection."""
+import hashlib
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, Union
+
+
+class CheckpointError(Exception):
+    """Raised when checkpoint loading fails due to corruption, missing file, or checksum mismatch."""
+    pass
+
+
+class CheckpointManager:
+    def __init__(self, storage_dir: Union[str, Path]):
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_path(self, name: str) -> Path:
+        return self.storage_dir / f"{name}.json"
+
+    def save(self, name: str, data: Dict[str, Any]) -> Path:
+        """Atomically save checkpoint data with a SHA-256 checksum."""
+        path = self._get_path(name)
+        payload = {
+            "data": data,
+            "version": 1,
+        }
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        checksum = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        
+        envelope = {
+            "payload": payload,
+            "checksum": checksum,
+        }
+        envelope_serialized = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
+
+        fd, temp_path = tempfile.mkstemp(dir=str(self.storage_dir), prefix=".tmp_ckpt_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(envelope_serialized)
+            os.replace(temp_path, path)
+            os.chmod(path, 0o600)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise CheckpointError(f"Failed to save checkpoint {name}: {e}") from e
+        return path
+
+    def load(self, name: str) -> Dict[str, Any]:
+        """Load checkpoint data, validating the SHA-256 checksum."""
+        path = self._get_path(name)
+        if not path.exists():
+            raise CheckpointError(f"Checkpoint {name} not found at {path}")
+        
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            envelope = json.loads(content)
+            
+            if "payload" not in envelope or "checksum" not in envelope:
+                raise CheckpointError("Invalid checkpoint envelope format")
+            
+            payload = envelope["payload"]
+            expected_checksum = envelope["checksum"]
+            
+            serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            actual_checksum = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            
+            if actual_checksum != expected_checksum:
+                raise CheckpointError("Checkpoint checksum verification failed (data corrupted)")
+            
+            return payload["data"]
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            raise CheckpointError(f"Corrupted checkpoint file {name}: {e}") from e
+        except CheckpointError:
+            raise
+        except Exception as e:
+            raise CheckpointError(f"Failed to load checkpoint {name}: {e}") from e
+EOF
+
+echo "==> [4/5] Writing unit tests..."
+cat << 'EOF' > tests/test_filelock.py
+"""Unit tests for machine-local file locking."""
+import pytest
+from core.lib.ultra.wildcards.filelock import file_lock
+
+
+def test_file_lock_acquires_and_releases(tmp_path):
+    lock_file = tmp_path / "test.lock"
+    with file_lock(lock_file):
+        assert lock_file.exists()
+    assert lock_file.exists()
+EOF
+
+cat << 'EOF' > tests/test_checkpoint.py
+"""Unit tests for CheckpointManager and corruption handling."""
+import json
+import pytest
+from core.lib.ultra.wildcards.checkpoint import CheckpointManager, CheckpointError
+
+
+def test_checkpoint_save_and_load(tmp_path):
+    mgr = CheckpointManager(tmp_path)
+    mgr.save("task_1", {"status": "running", "n": 42})
+    data = mgr.load("task_1")
+    assert data == {"status": "running", "n": 42}
+
+
+def test_rejects_corruption(tmp_path):
+    mgr = CheckpointManager(tmp_path)
+    path = mgr.save("task_2", {"n": 1})
+    
+    with open(path, "r", encoding="utf-8") as f:
+        envelope = json.load(f)
+    
+    envelope["payload"]["data"]["n"] = 999
+    
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(envelope, f)
+        
+    with pytest.raises(CheckpointError, match="checksum verification failed"):
+        mgr.load("task_2")
+
+
+def test_rejects_malformed_json(tmp_path):
+    mgr = CheckpointManager(tmp_path)
+    path = mgr.save("task_3", {"n": 10})
+    
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{ invalid json")
+        
+    with pytest.raises(CheckpointError, match="Corrupted checkpoint file"):
+        mgr.load("task_3")
+
+
+def test_missing_checkpoint_raises(tmp_path):
+    mgr = CheckpointManager(tmp_path)
+    with pytest.raises(CheckpointError, match="not found"):
+        mgr.load("nonexistent")
+EOF
+
+echo "==> [5/5] Running test suite and anchoring resilience manifest..."
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -v tests/
+
+find core -type f -name "*.py" -exec sha256sum {} + | sort > .resilience.sha256
+echo "==> Success: Wave-3 wildcard modules verified green and manifest anchored."
 1. Production Configuration Generator (scripts/generate_config.py)
 This production-grade script integrates concurrent metadata fetching, cryptographic signature fingerprint verification, strict JSON schema validation, and deterministic hashing.
 #!/usr/bin/env python3
